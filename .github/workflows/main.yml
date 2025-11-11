@@ -1,4 +1,4 @@
-name: Multi ngrok + RDP Nodes (Parallel)
+name: Single ngrok + RDP Node
 
 on:
   workflow_dispatch:
@@ -101,7 +101,8 @@ jobs:
             Write-Output "⚠️ Unable to fetch tunnel info from ngrok API."
             Get-Content .\ngrok.log -ErrorAction SilentlyContinue
           }
-          - name: Keep Alive (approx 6 hours)
+
+      - name: Keep Alive (approx 6 hours)
         shell: pwsh
         run: |
           for ($i = 0; $i -lt 72; $i++) {
