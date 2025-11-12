@@ -1,93 +1,143 @@
-name: Setup ngrok and Remote Desktop (Matrix)
+name: Setup ngrok and Remote Desktop
 
 on:
-  workflow_dispatch:
-    inputs:
-      node_count:
-        description: "کتنے RDP نوڈز چلانے ہیں (مثلاً 1, 2, 3...)"
-        required: false
-        default: "2"
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
   setup-ngrok:
     runs-on: windows-latest
     timeout-minutes: 360  # Max allowed: 6 hours
 
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ${{ fromJson(format('[{0}]', join(',', range(1, fromJson(inputs.node_count))))) }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Download ngrok (with retry)
+        shell: pwsh
         run: |
-          $retry = 3
-          while ($retry -gt 0) {
+          $url = 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip'
+          $out = 'ngrok.zip'
+          $max = 4
+          $i = 0
+          while ($i -lt $max) {
             try {
-              Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip -UseBasicParsing
-              if (Test-Path ngrok.zip) { break }
+              Write-Host "Downloading ngrok (attempt $($i+1))..."
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -ErrorAction Stop
+              if (Test-Path $out) { break }
             } catch {
-              Write-Host "Retrying download... ($retry left)"
+              Write-Host "Retrying download... ($($max - $i - 1) left) - $($_.Exception.Message)"
             }
-            Start-Sleep -Seconds 5
-            $retry--
+            Start-Sleep -Seconds (5 * ($i + 1))
+            $i++
           }
-          if (!(Test-Path ngrok.zip)) { throw "❌ Failed to download ngrok after retries." }
+          if (!(Test-Path $out)) { throw "❌ Failed to download ngrok after $max attempts." }
 
       - name: Extract ngrok
+        shell: pwsh
         run: |
-          Expand-Archive ngrok.zip -DestinationPath .
+          Expand-Archive ngrok.zip -DestinationPath . -Force
           if (!(Test-Path .\ngrok.exe)) { throw "❌ Failed to extract ngrok." }
 
       - name: Update ngrok
-        run: .\ngrok.exe update
+        shell: pwsh
+        run: |
+          if (Test-Path .\ngrok.exe) {
+            .\ngrok.exe update --no-prompt || Write-Host "ngrok update returned non-zero (continuing)"
+          } else {
+            throw "ngrok.exe not found for update."
+          }
 
       - name: Authenticate ngrok
-        run: .\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+        shell: pwsh
+        run: |
+          if (!(Test-Path .\ngrok.exe)) { throw "ngrok.exe missing before auth" }
+          .\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
 
       - name: Enable Remote Desktop
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+          try {
+            Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction Stop
+          } catch {
+            Write-Host "Warning: Could not set fDenyTSConnections: $($_.Exception.Message)"
+          }
+          try {
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
+          } catch {
+            Write-Host "Warning: Could not enable firewall group 'Remote Desktop' (may vary by image): $($_.Exception.Message)"
+          }
+          try {
+            Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -ErrorAction Stop
+          } catch {
+            Write-Host "Warning: Could not set UserAuthentication (NLA). $($_.Exception.Message)"
+          }
 
-      - name: Set Password for runneradmin
+      - name: Set Password for runneradmin (robust)
+        shell: pwsh
         run: |
-          $user = Get-LocalUser -Name "runneradmin"
-          if ($user.Enabled -eq $false) { Enable-LocalUser -Name "runneradmin" }
-          $secPass = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $secPass
+          # This step preserves your existing behavior (keeps the same password string).
+          $plain = 'P@ssw0rd!'
+          $secPass = ConvertTo-SecureString $plain -AsPlainText -Force
+          try {
+            $user = Get-LocalUser -Name "runneradmin" -ErrorAction Stop
+            if ($user.Enabled -eq $false) { Enable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue }
+            Set-LocalUser -Name "runneradmin" -Password $secPass -ErrorAction Stop
+            Write-Host "Updated password for existing runneradmin."
+          } catch {
+            Write-Host "runneradmin not found — creating user..."
+            try {
+              New-LocalUser -Name "runneradmin" -Password $secPass -FullName "runneradmin" -Description "Auto-created account for RDP" -ErrorAction Stop
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+              Write-Host "runneradmin created and added to Remote Desktop Users."
+            } catch {
+              Write-Error "Failed to create runneradmin: $($_.Exception.Message)"
+              throw
+            }
+          }
 
       - name: Start ngrok TCP tunnel (RDP port)
+        shell: pwsh
         run: |
-          Start-Process -FilePath .\ngrok.exe -ArgumentList "tcp 3389" -WindowStyle Hidden
+          if (!(Test-Path .\ngrok.exe)) { throw "ngrok.exe not found, cannot start tunnel." }
+          # Start ngrok and redirect output to ngrok.log for diagnostics
+          Start-Process -FilePath .\ngrok.exe -ArgumentList "tcp 3389 --log=stdout" -NoNewWindow -WindowStyle Hidden -RedirectStandardOutput ngrok.log -RedirectStandardError ngrok.log -PassThru | Out-Null
           Start-Sleep -Seconds 10
-          Get-Content ngrok.log -ErrorAction SilentlyContinue
+          if (Test-Path .\ngrok.log) {
+            Write-Host "ngrok log (last 50 lines):"
+            Get-Content ngrok.log -Tail 50 -ErrorAction SilentlyContinue
+          }
 
-      - name: Display connection info
+      - name: Display connection info (with retries)
+        shell: pwsh
         run: |
           $apiUrl = "http://127.0.0.1:4040/api/tunnels"
-          try {
-            $response = Invoke-RestMethod -Uri $apiUrl
-            $tcpAddr = ($response.tunnels | Where-Object { $_.proto -eq "tcp" }).public_url
-            if ($tcpAddr) {
-              Write-Output "✅ Connect using: $tcpAddr"
-            } else {
-              Write-Output "⚠️ Unable to fetch tunnel info yet."
+          $deadline = (Get-Date).AddSeconds(120)
+          $tcpAddr = $null
+          while ((Get-Date) -lt $deadline -and -not $tcpAddr) {
+            try {
+              $response = Invoke-RestMethod -Uri $apiUrl -ErrorAction Stop
+              if ($response -and $response.tunnels) {
+                $tcpAddr = ($response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1).public_url
+              }
+            } catch {
+              Write-Host "Ngrok API not ready yet... waiting 5s"
             }
-          } catch {
-            Write-Output "⚠️ Ngrok API not responding."
+            if (-not $tcpAddr) { Start-Sleep -Seconds 5 }
+          }
+          if ($tcpAddr) {
+            Write-Output "✅ Connect using: $tcpAddr"
+          } else {
+            Write-Output "⚠️ Unable to fetch tunnel info from ngrok API after retries."
+            if (Test-Path .\ngrok.log) { Get-Content .\ngrok.log -ErrorAction SilentlyContinue | Select-Object -Last 200 }
           }
 
       - name: Keep Alive (6 hours)
+        shell: pwsh
         run: |
           for ($i = 0; $i -lt 72; $i++) {
-            Write-Host "⏳ Still alive... Hour: $($i * 5) minutes"
+            Write-Host "⏳ Still alive... Minute: $($i * 5) - $(Get-Date -Format o)"
             Start-Sleep -Seconds 300
           }
         continue-on-error: true
