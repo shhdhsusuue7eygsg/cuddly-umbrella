@@ -1,12 +1,23 @@
-name: Single ngrok + RDP Node
+name: Multi ngrok + RDP Nodes (Matrix Version)
 
 on:
   workflow_dispatch:
+    inputs:
+      node_count:
+        description: "کتنے RDP نوڈز چلانے ہیں (مثلاً 1 سے 10)"
+        required: false
+        default: "4"
 
 jobs:
-  rdp-node-1:
+  rdp-node:
     runs-on: windows-latest
     timeout-minutes: 360
+    strategy:
+      matrix:
+        node: ${{ fromJson(format('[{0}]', join(',', range(1, fromJson(inputs.node_count))))) }}
+      # اگر تم چاہتے ہو کہ ایک نوڈ فیل ہو تب بھی باقی چلیں
+      fail-fast: false
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -64,7 +75,6 @@ jobs:
             $user = Get-LocalUser -Name 'runneradmin' -ErrorAction Stop
             if ($user.Enabled -eq $false) { Enable-LocalUser -Name 'runneradmin' }
           } catch {
-            # If runneradmin doesn't exist, create it (best-effort)
             Write-Host "runneradmin not found — creating user..."
             $secPass = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
             New-LocalUser -Name 'runneradmin' -Password $secPass -FullName 'runneradmin' -Description 'Auto-created account for RDP'
